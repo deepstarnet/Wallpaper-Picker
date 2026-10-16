@@ -2,15 +2,15 @@ import os
 import subprocess
 import sys
 import hashlib
+import threading
 
 try:
     import gi   
     gi.require_version('Gtk', '4.0')
     gi.require_version('GdkPixbuf', '2.0')
-    from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
+    from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gio
 except Exception as e:
     print(f"Missing dependencies: {e}")
-    print("Run: sudo dnf install python3-gobject gtk4 gdk-pixbuf2")
     sys.exit(1)
 
 WALLPAPER_DIR = os.path.expanduser("~/Pictures/CyberWalls")
@@ -20,19 +20,15 @@ THUMB_HEIGHT = 150
 CACHE_DIR = os.path.expanduser("~/.cache/wallpaper-picker")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-def set_wallpaper(path: str):
-    subprocess.run(['pkill', 'swaybg'], check=False)
-    subprocess.Popen(['swaybg', '-i', path, '-m', 'fill'])
-
 def load_thumbnail(path: str) -> GdkPixbuf.Pixbuf | None:
-    mtime = str(os.path.getmtime(path))
-    key = hashlib.md5((path + mtime).encode()).hexdigest()
-    cache_path = os.path.join(CACHE_DIR, key + ".png")
-
-    if os.path.exists(cache_path):
-        return GdkPixbuf.Pixbuf.new_from_file(cache_path)
-    
     try:
+        mtime = str(os.path.getmtime(path))
+        key = hashlib.md5((path + mtime).encode()).hexdigest()
+        cache_path = os.path.join(CACHE_DIR, key + ".png")
+
+        if os.path.exists(cache_path):
+            return GdkPixbuf.Pixbuf.new_from_file(cache_path)
+        
         pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, THUMB_WIDTH, THUMB_HEIGHT, False)
         pixbuf.savev(cache_path, "png", [], [])
         return pixbuf
@@ -45,51 +41,68 @@ class WallpaperPicker(Gtk.ApplicationWindow):
 
         self.set_decorated(False)
         self.set_resizable(False)
-
-        # Выставляем размер под горизонт-ленту
         self.set_default_size(1200, 220)
 
+        self.swaybg_proc = None
+        self.loading = False
+        self.loaded = False
+
         self._build_ui()
-        self._load_wallpapers()
         self._apply_css()
 
-        # Закрытие по Escape
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect('key-pressed', self._on_key)
         self.add_controller(key_ctrl)
 
+        self.connect('close-request', self._on_close_request)
+
     def _build_ui(self):
-        # Горизонтальный скролл без шапки и рамок, как в Rofi
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         scroll.set_hexpand(True)
         scroll.set_vexpand(True)
 
-        # Плотный горизонтальный поток без спайсинга (margin/padding: 0)
         self.flow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.flow.set_valign(Gtk.Align.FILL)
         scroll.set_child(self.flow)
         
         self.set_child(scroll)
 
-    def _load_wallpapers(self):
-        if not os.path.isdir(WALLPAPER_DIR):
-            os.makedirs(WALLPAPER_DIR, exist_ok=True)
+    def show_picker(self):
+        self.present()
+        
+        if not self.loaded and not self.loading:
+            self.loading = True
+            threading.Thread(target=self._load_wallpapers_async, daemon=True).start()
 
-        files = sorted([
-            f for f in os.listdir(WALLPAPER_DIR)
-            if f.lower().endswith(SUPPORTED)
-        ])
+    def _load_wallpapers_async(self):
+        try:
+            if not os.path.isdir(WALLPAPER_DIR):
+                os.makedirs(WALLPAPER_DIR, exist_ok=True)
 
-        for fname in files:
-            path = os.path.join(WALLPAPER_DIR, fname)
-            GLib.idle_add(self._add_thumb, path, fname)
+            files = sorted([
+                f for f in os.listdir(WALLPAPER_DIR)
+                if f.lower().endswith(SUPPORTED)
+            ])
 
-    def _add_thumb(self, path, fname):
-        pixbuf = load_thumbnail(path)
-        if not pixbuf:
-            return False
+            for fname in files:
+                path = os.path.join(WALLPAPER_DIR, fname)
+                pixbuf = load_thumbnail(path)
+                if pixbuf:
+                    GLib.idle_add(self._add_thumb, path, fname, pixbuf)
+            
+            GLib.idle_add(self._mark_loaded, True)
+        except Exception as e:
+            print(f"Failed to load wallpapers: {e}", file=sys.stderr)
+            GLib.idle_add(self._mark_loaded, False)
 
+    def _mark_loaded(self, success: bool):
+        self.loading = False
+        if success:
+            self.loaded = True
+        return False
+
+    def _add_thumb(self, path, fname, pixbuf):
         btn = Gtk.Button()
         btn.add_css_class('element')
         btn.set_tooltip_text(fname)
@@ -105,13 +118,28 @@ class WallpaperPicker(Gtk.ApplicationWindow):
         self.flow.append(btn)
         return False
 
+    def set_wallpaper(self, path: str):
+        if self.swaybg_proc and self.swaybg_proc.poll() is None:
+            self.swaybg_proc.terminate()
+            try:
+                self.swaybg_proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.swaybg_proc.kill()
+        
+        self.swaybg_proc = subprocess.Popen(['swaybg', '-i', path, '-m', 'fill'])
+
     def _apply(self, path):
-        set_wallpaper(path)
-        self.close()
+        self.set_wallpaper(path)
+        self.set_visible(False)
+
+    def _on_close_request(self, *args):
+        self.set_visible(False)
+        return True
 
     def _on_key(self, ctrl, keyval, keycode, state):
         if keyval == Gdk.KEY_Escape:
-            self.close()
+            self.set_visible(False)
+            return True
         return False
 
     def _apply_css(self):
@@ -132,7 +160,7 @@ class WallpaperPicker(Gtk.ApplicationWindow):
         }
 
         .element:hover, .element:focus {
-            border: 1px solid #ff0055; /* аналог @re0 из rofi */
+            border: 1px solid #ff0055;
             background: transparent;
         }
 
@@ -160,11 +188,16 @@ class WallpaperPicker(Gtk.ApplicationWindow):
 
 class WallpaperApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id='dev.deepstar.wallpaper-picker')
+        super().__init__(
+            application_id='dev.deepstar.wallpaper-picker',
+            flags=Gio.ApplicationFlags.FLAGS_NONE
+        )
+        self.win = None
 
     def do_activate(self):
-        win = WallpaperPicker(self)
-        win.present()
+        if not self.win:
+            self.win = WallpaperPicker(self)
+        self.win.show_picker()
 
 
 if __name__ == '__main__':
